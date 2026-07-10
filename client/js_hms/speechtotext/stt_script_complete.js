@@ -1,3 +1,5 @@
+
+
 (function () {
     'use strict';
 
@@ -312,7 +314,6 @@
         "acy clo vir": "Acyclovir",
 
         // ── Antihypertensives / Diuretics ─────────────────────────────────────
-        "amlodipine": "Amlodipine",
         "hydro chloro thiazide": "Hydrochlorothiazide",
         "hydrochlorothiazide": "Hydrochlorothiazide",
         "hydro chloe roh thiazide": "Hydrochlorothiazide",
@@ -342,7 +343,6 @@
         "metoclopramide": "Metoclopramide",
         "ondan setron": "Ondansetron",
         "ondansetron": "Ondansetron",
-        "panto prazole": "Pantoprazole",
         "lactu lose": "Lactulose",
         "lactulose": "Lactulose",
         "bi sa co dyl": "Bisacodyl",
@@ -526,19 +526,23 @@
     let ws = null;
     let isRecording = false;
     let isConnecting = false;
-    let committedText = '';
-    let baseText = '';
-    let lastServerRawText = '';
+    let committedText = '';       // text dictated in the CURRENT session only
     let reconnectTimer = null;
     let heartbeatTimer = null;
     let editorDiv = null;
     let textBox = null;
 
+    // The DOM node that holds ONLY what this dictation session produces.
+    // It is appended after whatever the user already had in the editor,
+    // and it is the ONLY part of the editor's HTML that this script ever
+    // rewrites. Pre-existing formatted content is never touched.
+    let dictationContainer = null;
+
     // Browser Speech Recognition for partials
     let recognition = null;
     let browserPartial = '';
     let wsPartial = '';
-    
+
     // ─── DOM HELPERS ──────────────────────────────────────────────────
 
     function getEditorDiv() {
@@ -561,62 +565,67 @@
         return textBox;
     }
 
-    function setEditorHTML(html) {
+    // Keeps the hidden textbox (the value that actually posts back to the
+    // server) in sync with whatever is currently in the visible editor.
+    function syncTextBox() {
         var div = getEditorDiv();
-        if (div) {
-            div.innerHTML = html;
-        }
         var tb = getTextBox();
         if (tb) {
-            tb.value = div ? div.innerHTML : html;
+            tb.value = div ? div.innerHTML : '';
         }
     }
 
-    function getEditorText() {
+    // Creates (once per Dictate click) a fresh, empty container and appends
+    // it at the END of the editor's existing content. Everything that was
+    // already in the editor — including its original formatting — is left
+    // completely untouched.
+    //function createDictationContainer() {
+    //    var div = getEditorDiv();
+    //    if (!div) return null;
+
+    //    var container = document.createElement('div');
+    //    container.className = 'stt-dictation-session';
+    //    div.appendChild(container);
+    //    dictationContainer = container;
+    //    return container;
+    //}
+    function createDictationContainer() {
         var div = getEditorDiv();
-        if (div) {
-            return div.innerText || '';
-        }
-        var tb = getTextBox();
-        return tb ? tb.value : '';
-    }
-    function mergeTranscript(oldText, newText) {
-        if (!newText) return oldText;                 // empty final → keep old, don't wipe
-        if (!oldText) return newText;
+        if (!div) return null;
 
-        var oldWords = oldText.trim().split(/\s+/);
-        var newWords = newText.trim().split(/\s+/);
+        var container = document.createElement("span");
+        container.className = "stt-dictation-session";
+        container.style.display = "inline";
 
-        // Find the largest overlap between the END of oldWords and the START of newWords.
-        // This covers: exact cumulative continuation, cumulative with small edits,
-        // and fresh restarts (overlap = 0, so we just append).
-        var maxOverlap = Math.min(oldWords.length, newWords.length);
-        var overlap = 0;
+        var sel = window.getSelection();
 
-        for (var len = maxOverlap; len > 0; len--) {
-            var tail = oldWords.slice(oldWords.length - len).join(' ').toLowerCase();
-            var head = newWords.slice(0, len).join(' ').toLowerCase();
-            if (tail === head) {
-                overlap = len;
-                break;
+        if (sel.rangeCount > 0) {
+            var range = sel.getRangeAt(0);
+
+            // Ensure caret is inside editor
+            if (div.contains(range.commonAncestorContainer)) {
+
+                range.deleteContents();
+                range.insertNode(container);
+
+                // Move cursor after container
+                range.setStartAfter(container);
+                range.collapse(true);
+
+                sel.removeAllRanges();
+                sel.addRange(range);
+
+                dictationContainer = container;
+                return container;
             }
         }
 
-        if (overlap === newWords.length) {
-            // newText is fully contained in oldText already (stray duplicate/late final) — ignore
-            return oldText;
-        }
-
-        if (overlap > 0) {
-            // newText continues oldText — replace overlapping tail, append the rest
-            var remainder = newWords.slice(overlap).join(' ');
-            return oldWords.slice(0, oldWords.length - overlap).concat(newWords).join(' ');
-            // (keeps oldWords intact, replaces only the tail with newWords which already includes the overlap)
-        }
-
-        // No overlap at all → treat as a brand-new segment (e.g. after a reset) → append
-        return oldText + ' ' + newText;
+        // fallback
+        div.appendChild(container);
+        dictationContainer = container;
+        return container;
     }
+
     function applyCorrections(text) {
         if (!text) return text;
         var result = text;
@@ -629,21 +638,41 @@
         return result;
     }
 
-
     // ─── UPDATE EDITOR WITH HYBRID DISPLAY ──────────────────────────
+    // Only ever writes into dictationContainer — never into the editor's
+    // pre-existing HTML.
+
+    // "next line"/"new line"/"enter" -> '\n'  -> soft break (<br>) inside
+    //   the SAME paragraph, close together.
+    // "next paragraph"/"new paragraph" -> '\n\n' -> a NEW <p> block with
+    //   real spacing, so it's visually distinct from a plain line break.
+    function buildCommittedHTML(text) {
+        if (!text || !text.trim()) return '';
+        var paragraphs = text.split(/\n{2,}/);
+        return paragraphs.map(function (para) {
+
+            var lines = para.split('\n')
+                .map(function (l) { return l.trim(); })
+                .filter(Boolean);
+
+            return lines.join("<br>");
+
+        }).join("<br><br>");
+        //return paragraphs.map(function (para) {
+        //    var lines = para.split('\n')
+        //        .map(function (l) { return l.trim(); })
+        //        .filter(function (l) { return l.length > 0; });
+        //    if (!lines.length) return '';
+        //    return '<p style="color:#000000; margin:0 0 14px 0;">' + lines.join('<br>') + '</p>';
+        //}).join('');
+    }
 
     function updateEditorDisplay() {
-        var displayHTML = '';
+        if (!dictationContainer) return;
 
-        var fullCommitted = baseText + committedText;
-        if (fullCommitted.trim()) {
-            var committedLines = fullCommitted.split('\n').filter(function (p) { return p.trim(); });
-            displayHTML = committedLines.map(function (p) {
-                return '<p style="color:#000000; margin:0 0 4px 0;">' + p + '</p>';
-            }).join('');
-        }
+        var displayHTML = buildCommittedHTML(committedText);
 
-        // Only ever one partial source active at a time now: browser (preferred)
+        // Only ever one partial source active at a time: browser (preferred)
         // or whisper-as-fallback (only when browser STT unsupported).
         var partialText = browserPartial || wsPartial;
 
@@ -658,7 +687,8 @@
             if (liveText2) liveText2.textContent = 'Listening…';
         }
 
-        setEditorHTML(displayHTML);
+        dictationContainer.innerHTML = displayHTML;
+        syncTextBox();
     }
 
     // ─── BROWSER SPEECH RECOGNITION (for partial/light grey) ────────
@@ -734,8 +764,9 @@
 
     // ─── WEBSOCKET CONNECTION (for final/black text) ────────────────
 
+
     function getWebSocketUrl() {
-        var langValue =  'en-IN';
+        var langValue = 'en-IN';
         var host = window.location.hostname;
         var isLocal = (host === 'localhost' || host === '127.0.0.1');
         var proto = (window.location.protocol === 'https:' && !isLocal) ? 'wss' : 'ws';
@@ -815,8 +846,12 @@
                 updateEditorDisplay();
             }
             return;
-        } 
+        }
         else if (msg.type === 'final') {
+            // msg.text is the server's cumulative transcript for THIS
+            // session only (it resets server-side on "stop"), so we can
+            // just take it as-is — it already contains '\n' / '\n\n' for
+            // any "new line"/"next line"/"enter"/"new paragraph" commands.
             committedText = applyCorrections(msg.text);
             browserPartial = '';
             wsPartial = '';
@@ -827,7 +862,6 @@
             }
         }
     }
-
 
     let audioContext = null;
     let audioProcessor = null;
@@ -929,27 +963,24 @@
         }
     }
 
-
     // ─── PUBLIC API ──────────────────────────────────────────────────
 
     window.stt_start = function () {
         if (isRecording) return;
 
-        // Clear state
+        // Clear session state
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.close();
         }
         ws = null;
         browserPartial = '';
         wsPartial = '';
-        lastServerRawText = '';
+        committedText = '';
 
-        // Get existing text as committed base
-        baseText = getEditorText();
-        if (baseText && !baseText.endsWith('\n')) {
-            baseText += '\n';
-        }
-        committedText = ''; 
+        // IMPORTANT: we do NOT read/replace the editor's existing content.
+        // We only create a new empty container and append it after whatever
+        // is already there, so pre-existing formatting is never disturbed.
+        createDictationContainer();
 
         setButtons(true);
         setStatus('Connecting…', 'stt-dot-idle');
@@ -991,7 +1022,8 @@
             ws = null;
         }
 
-        // Clear partials and update
+        // Clear partials and update (this only rewrites the dictation
+        // container, so any pre-existing text/formatting is untouched)
         browserPartial = '';
         wsPartial = '';
         updateEditorDisplay();
@@ -1005,25 +1037,33 @@
         if (bar) bar.classList.remove('active');
     }
 
+    // Clears ONLY the text produced by the current/last dictation session.
+    // Anything the user had in the editor before pressing Dictate is left
+    // completely alone.
     window.stt_clear = function () {
         committedText = '';
-        baseText = '';
         browserPartial = '';
         wsPartial = '';
-        lastServerRawText = '';   // NEW
-        setEditorHTML('');
+        if (dictationContainer && dictationContainer.parentNode) {
+            dictationContainer.parentNode.removeChild(dictationContainer);
+        }
+        dictationContainer = null;
+        syncTextBox();
         setStatus('Ready', 'stt-dot-idle');
     };
 
     window.stt_getText = function () {
-        return getEditorText();
+        var div = getEditorDiv();
+        return div ? (div.innerText || '') : '';
     };
 
+    // Appends given text as a new dictation session block, without
+    // touching any pre-existing content.
     window.stt_setText = function (text) {
-        committedText = text + '\n';
-        setEditorHTML(text);
+        createDictationContainer();
+        committedText = text;
+        updateEditorDisplay();
     };
-
 
     // ─── INIT ────────────────────────────────────────────────────────
 
@@ -1043,3 +1083,5 @@
     });
 
 })();
+
+ 
