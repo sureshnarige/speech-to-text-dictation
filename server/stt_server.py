@@ -1,8 +1,8 @@
-
-import asyncio, json, logging, re
+ import asyncio, json, logging, re
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import websockets
+import difflib 
 from faster_whisper import WhisperModel
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -86,7 +86,10 @@ RADIOLOGY_PROMPT = (
     "echotexture, echogenicity, echogenic, hypoechoic, hyperechoic, "
     "intrahepatic biliary radicle dilatation, portal vein, common bile duct, "
     "space occupying lesion, focal lesion, hepatomegaly, splenomegaly, "
-    "cholelithiasis, cholecystitis, ascites, calculus, cortex, parenchyma."
+    "cholelithiasis, cholecystitis, ascites, calculus, cortex, parenchyma. "
+    "The speaker sometimes pauses briefly and says a short formatting "
+    "command on its own, such as 'new line', 'next line', 'new paragraph', "
+    "'next paragraph', or 'enter'."
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -94,9 +97,23 @@ RADIOLOGY_PROMPT = (
 # appended to the session transcript.
 # ─────────────────────────────────────────────────────────────────────────
 VOICE_COMMANDS = [
-    (re.compile(r'\b(new paragraph|next paragraph)\b', re.IGNORECASE), '\n\n'),
-    (re.compile(r'\b(new line|next line|newline)\b', re.IGNORECASE), '\n'),
+    (
+        ['new paragraph', 'next paragraph', 'new para', 'next para', 'newparagraph'],
+        '\n\n',
+    ),
+    (
+        ['new line', 'next line', 'newline', 'enter', 'new lines', 'next lines',
+         'nextline', 'next to the line', 'next slide', 'the new line',
+         'new lion', 'next lion'],
+        '\n',
+    ),
 ]
+_COMMAND_PHRASES = [(phrase, repl) for phrases, repl in VOICE_COMMANDS for phrase in phrases]
+_COMMAND_REGEXES = [
+    (re.compile(r'\b' + re.escape(phrase) + r'\b', re.IGNORECASE), repl)
+    for phrase, repl in _COMMAND_PHRASES
+]
+COMMAND_FUZZY_THRESHOLD = 0.72
 
 # ─────────────────────────────────────────────────────────────────────────
 # KNOWN WHISPER HALLUCINATION PHRASES — generic YouTube-training artifacts
@@ -114,11 +131,44 @@ HALLUCINATION_PATTERNS = [
     re.compile(r'^\s*thank you\.?\s*$', re.IGNORECASE),
 ]
 
+def _normalize_for_match(text):
+    t = text.lower().strip()
+    t = re.sub(r'[.,!?;:]+$', '', t)   # Whisper often adds trailing punctuation
+    t = re.sub(r'\s+', ' ', t)
+    return t
+
+def match_whole_utterance_command(text):
+    """
+    If this ENTIRE utterance is (closely) just a formatting command —
+    even if Whisper slightly mis-transcribed it — return the replacement
+    ('\n' or '\n\n'). Otherwise return None, meaning: treat as normal
+    dictated content.
+ 
+    This is what rescues cases like "Next slide." or "Next to the line."
+    which were really an attempt at "next line" but got mis-heard because
+    a 1-3 word utterance gives Whisper very little context.
+    """
+    norm = _normalize_for_match(text)
+    if not norm:
+        return None
+ 
+    best_ratio = 0.0
+    best_repl = None
+    for phrase, repl in _COMMAND_PHRASES:
+        ratio = difflib.SequenceMatcher(None, norm, phrase).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_repl = repl
+ 
+    if best_ratio >= COMMAND_FUZZY_THRESHOLD:
+        return best_repl
+    return None
 
 def apply_voice_commands(text):
-    """Replace spoken formatting commands with actual line breaks and
-    tidy up any resulting whitespace."""
-    for pattern, replacement in VOICE_COMMANDS:
+    """Replace command phrases that appear EMBEDDED inside a longer
+    dictated sentence (e.g. '...echotexture new line no focal lesion...')
+    and tidy up any resulting whitespace."""
+    for pattern, replacement in _COMMAND_REGEXES:
         text = pattern.sub(replacement, text)
     text = re.sub(r'[ \t]*\n[ \t]*', '\n', text)   # trim spaces around line breaks
     text = re.sub(r'\n{3,}', '\n\n', text)          # cap consecutive blank lines at one
@@ -134,26 +184,37 @@ def strip_hallucinations(text):
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
+
 def append_to_session(session_text, new_text):
     """Append a newly committed utterance onto the running session
-    transcript. Never overwrites what came before a pause."""
-    new_text = apply_voice_commands(new_text)
-    if not new_text:
+    transcript. Never overwrites what came before a pause.
+ 
+    First checks whether the WHOLE utterance was a (possibly mis-heard)
+    formatting command on its own. If not, falls back to detecting a
+    command embedded mid-sentence. Only if neither applies is the text
+    treated as literal dictated content.
+    """
+    whole_command = match_whole_utterance_command(new_text)
+    if whole_command is not None:
+        processed = whole_command
+    else:
+        processed = apply_voice_commands(new_text)
+ 
+    if not processed:
         return session_text
     if not session_text:
-        return new_text
-    if new_text.startswith('\n'):
+        return processed
+    if processed.startswith('\n'):
         # Voice command already supplies the separator (new line/paragraph)
-        return session_text + new_text
-    return session_text + ' ' + new_text
-
+        return session_text + processed
+    return session_text + ' ' + processed
 
 print("Loading Whisper model...")
 # Single model used for BOTH partial (repeated) passes and final passes.
-# "small" is the accuracy/speed sweet spot for medical vocabulary on CPU.
+# "small" is the accuracy/speed sweet spot for medical vocabulary on CPU,device='cpu',compute_type="int8".
 # If partial passes feel too slow/laggy on your hardware, try "base" —
 # you lose a bit of accuracy on rare terms but gain noticeable speed.
-# For GPU: WhisperModel("small", device="cuda", compute_type="float16", cpu_threads=4)
+#model = WhisperModel("small", device="cuda", compute_type="float16", cpu_threads=4)
 model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=4)
 print("Model ready.")
 
@@ -385,3 +446,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+ 
